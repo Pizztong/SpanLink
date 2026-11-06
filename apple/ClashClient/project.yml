@@ -14,7 +14,7 @@ settings:
     SWIFT_VERSION: '5.9'
     GENERATE_INFOPLIST_FILE: true
     CURRENT_PROJECT_VERSION: 1
-    MARKETING_VERSION: 1.0.9
+    MARKETING_VERSION: 1.0.0
     CLASH_SOURCE_REVISION: source-build
     OTHER_LDFLAGS:
     - -lresolv
@@ -87,7 +87,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: Clash
+        CFBundleDisplayName: SpanLink
         CFBundleShortVersionString: $(MARKETING_VERSION)
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true

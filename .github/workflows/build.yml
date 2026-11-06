@@ -1,0 +1,133 @@
+# SpanLink iOS — unsigned build from the unmodified ProjectClash base.
+# Phase 1 (scaffolding): repo + base build green only. No UI/feature changes.
+# Runner MUST be xcode-27: the project needs Xcode 27.0+, Go 1.26.10,
+# XcodeGen and Python 3 + PyYAML. It cannot build on macos-15 / Xcode 26.3.
+name: Build iOS (unsigned)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 27 and install XcodeGen
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+          xcodegen --version
+
+      - name: Set up Go 1.26.10
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.10'
+
+      - name: Set up Python venv with PyYAML
+        run: |
+          python3 -m venv .build/python-env
+          .build/python-env/bin/python -m pip install --upgrade pip PyYAML
+          .build/python-env/bin/python --version
+          go version
+
+      # Fetches the pinned kernel + adapter sources (Dependencies.lock.json),
+      # installs gomobile/gobind and builds the five-slice SDK (make lib_apple).
+      - name: Bootstrap SDK
+        run: .build/python-env/bin/python scripts/bootstrap.py
+
+      # Sets bundle base com.pizzt.app (app group becomes group.com.pizzt.app),
+      # runs XcodeGen to generate ClashClient.xcodeproj, and builds the mac CLI.
+      # project.yml already carries MARKETING_VERSION 1.0.0 and display name SpanLink.
+      - name: Configure (bundle base com.pizzt.app)
+        run: .build/python-env/bin/python scripts/configure.py --bundle-base com.pizzt.app
+
+      - name: Verify generated project
+        run: |
+          ls apple/ClashClient/ClashClient.xcodeproj
+          xcodebuild -project apple/ClashClient/ClashClient.xcodeproj -scheme ClashiOS -showBuildSettings -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO | grep -E '^(    PRODUCT_BUNDLE_IDENTIFIER|    MARKETING_VERSION|    PRODUCT_NAME|    CLASH_APP_GROUP) =' || true
+
+      - name: Archive ClashiOS (unsigned)
+        run: |
+          xcodebuild -project apple/ClashClient/ClashClient.xcodeproj \
+            -scheme ClashiOS -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/SpanLink.xcarchive \
+            CODE_SIGNING_ALLOWED=NO archive
+
+      # Ad-hoc codesign with entitlements (Xcode 26.3+ forbids ad-hoc signing
+      # for packaging, so sign the built products directly with `codesign`):
+      # app + packet-tunnel extension get App Groups + packet-tunnel-provider;
+      # controls/share extensions get App Groups only; the embedded framework
+      # is signed with no entitlements. Sign inner products before the .app.
+      - name: Codesign + package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$(echo build/SpanLink.xcarchive/Products/Applications/*.app)"
+          echo "App: $APP"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist"
+
+          python3 - <<'EOF'
+          import plistlib
+          group = "group.com.pizzt.app"
+          app_ent = {
+              "com.apple.security.application-groups": [group],
+              "com.apple.developer.networking.networkextension": ["packet-tunnel-provider"],
+          }
+          ext_ent = dict(app_ent)
+          groups_only = {"com.apple.security.application-groups": [group]}
+          with open("/tmp/app.entitlements", "wb") as f:
+              plistlib.dump(app_ent, f)
+          with open("/tmp/tunnel.entitlements", "wb") as f:
+              plistlib.dump(ext_ent, f)
+          with open("/tmp/groups.entitlements", "wb") as f:
+              plistlib.dump(groups_only, f)
+          print("entitlements written")
+          EOF
+
+          # Embedded frameworks first (no entitlements).
+          for fw in "$APP"/Frameworks/*.framework; do
+            [ -e "$fw" ] || continue
+            echo "Signing framework: $fw"
+            codesign --force --sign - "$fw"
+          done
+          # App extensions: tunnel gets packet-tunnel entitlement, others groups-only.
+          for appex in "$APP"/PlugIns/*.appex; do
+            [ -e "$appex" ] || continue
+            case "$(basename "$appex")" in
+              ClashiOSExtension.appex)
+                echo "Signing tunnel extension: $appex"
+                codesign --force --sign - --entitlements /tmp/tunnel.entitlements "$appex" ;;
+              *)
+                echo "Signing extension: $appex"
+                codesign --force --sign - --entitlements /tmp/groups.entitlements "$appex" ;;
+            esac
+          done
+          # The app itself last.
+          echo "Signing app: $APP"
+          codesign --force --sign - --entitlements /tmp/app.entitlements "$APP"
+          codesign -d --entitlements :- "$APP" 2>/dev/null | head -20 || true
+
+          rm -rf Payload SpanLink-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          ditto -c -k --keepParent Payload SpanLink-unsigned.ipa
+          ls -lh SpanLink-unsigned.ipa
+          md5 SpanLink-unsigned.ipa || md5sum SpanLink-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpanLink-unsigned
+          path: SpanLink-unsigned.ipa
+          if-no-files-found: error
